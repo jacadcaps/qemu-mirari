@@ -79,6 +79,8 @@ ppc_ss.add(when: 'CONFIG_MAC_OLDWORLD', if_true: files('mac_oldworld.c'))
 ppc_ss.add(when: 'CONFIG_MAC_NEWWORLD', if_true: files('mac_newworld.c'))
 # e500
 ppc_ss.add(when: 'CONFIG_E500PLAT', if_true: files('e500plat.c'))
+# Mirari (T1042)
+ppc_ss.add(when: 'CONFIG_MIRARI', if_true: files('mirari.c'))
 ppc_ss.add(when: 'CONFIG_MPC8544DS', if_true: files('mpc8544ds.c'))
 ppc_ss.add(when: 'CONFIG_E500', if_true: files(
   'e500.c',

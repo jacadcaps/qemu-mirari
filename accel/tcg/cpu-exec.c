@@ -231,7 +231,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
     CPUJumpCache *jc;
-    uint32_t hash;
+    uint32_t hash, gen;
 
     /* we should never be trying to look up an INVALID tb */
     tcg_debug_assert(!(s.cflags & CF_INVALID));
@@ -239,13 +239,20 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
 
-    tb = qatomic_read(&jc->array[hash].tb);
-    if (likely(tb &&
-               jc->array[hash].pc == s.pc &&
-               tb->cs_base == s.cs_base &&
-               tb->flags == s.flags &&
-               tb_cflags(tb) == s.cflags)) {
-        goto hit;
+    /*
+     * The generation has to be tested first: an entry left behind by a flush
+     * may point at a translation block that has already been freed.
+     */
+    gen = qatomic_read(tb_jmp_cache_gen(jc, hash));
+    if (likely(jc->array[hash].gen == gen)) {
+        tb = qatomic_read(&jc->array[hash].tb);
+        if (likely(tb &&
+                   jc->array[hash].pc == s.pc &&
+                   tb->cs_base == s.cs_base &&
+                   tb->flags == s.flags &&
+                   tb_cflags(tb) == s.cflags)) {
+            goto hit;
+        }
     }
 
     tb = tb_htable_lookup(cpu, s);
@@ -254,6 +261,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     }
 
     jc->array[hash].pc = s.pc;
+    jc->array[hash].gen = gen;
     qatomic_set(&jc->array[hash].tb, tb);
 
 hit:
@@ -978,6 +986,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
                 jc->array[h].pc = s.pc;
+                jc->array[h].gen = qatomic_read(tb_jmp_cache_gen(jc, h));
                 qatomic_set(&jc->array[h].tb, tb);
             }
 
@@ -1072,6 +1081,10 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     }
 
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+    /* Generation 0 is what the entries are zeroed to, so start past it. */
+    for (int i = 0; i < TB_JMP_CACHE_PAGES; i++) {
+        cpu->tb_jmp_cache->gen[i] = 1;
+    }
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);

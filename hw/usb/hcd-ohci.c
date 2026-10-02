@@ -1153,6 +1153,8 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
         }
 
         while ((ed.head & OHCI_DPTR_MASK) != ed.tail) {
+            uint32_t head_before = ed.head & OHCI_DPTR_MASK;
+
             trace_usb_ohci_ed_pkt(cur, (ed.head & OHCI_ED_H) != 0,
                     (ed.head & OHCI_ED_C) != 0, ed.head & OHCI_DPTR_MASK,
                     ed.tail & OHCI_DPTR_MASK, ed.next & OHCI_DPTR_MASK);
@@ -1175,9 +1177,19 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
                 }
             }
 
-            if (ed_cnt++ > ED_LINK_LIMIT) {
+            /*
+             * A TD longer than the endpoint's maximum packet size is sent one
+             * packet at a time and stays at the head of the list until it is
+             * done, so seeing the same TD again is normal and must not count
+             * against the loop limit: that is bounded by the TD length, which
+             * is at most sizeof(ohci->usb_buf), since ohci_service_td() makes
+             * a MaximumPacketSize of zero an error.  Only count the TDs that
+             * were retired, which is what catches a circular TD list.
+             */
+            if ((ed.head & OHCI_DPTR_MASK) != head_before &&
+                ed_cnt++ > ED_LINK_LIMIT) {
                 qemu_log_mask(LOG_GUEST_ERROR,
-                              "ohci: Too many endpoint descriptors in loop\n");
+                              "ohci: Too many transfer descriptors in loop\n");
                 ohci_die(ohci);
                 return 0;
             }

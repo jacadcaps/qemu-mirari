@@ -33,6 +33,10 @@ config PPCE500_PCI
     select PCI
     bool
 
+config MIRARI_PEX
+    select PCI
+    bool
+
 config VERSATILE_PCI
     select PCI
     bool

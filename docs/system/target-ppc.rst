@@ -19,6 +19,7 @@ help``.
 
    ppc/amigang
    ppc/embedded
+   ppc/mirari
    ppc/powermac
    ppc/powernv
    ppc/ppce500

@@ -388,6 +388,21 @@ union ppc_tlb_t {
     ppcmas_tlb_t *tlbm;
 };
 
+/*
+ * The 4 KiB pages of one megabyte of effective address, as 256 bits indexed
+ * by bits 19:12.  One of these per Book E 2.06 TLB slot records what the
+ * softmmu has translated through that slot, so that overwriting the slot can
+ * flush those pages instead of the whole softmmu index.  A megabyte covers
+ * every entry size software reloads TLB1 with in practice; a larger entry
+ * cannot be described this way and falls back to the whole index.
+ */
+#define BOOKE206_PAGES_SPAN (1 << 20)
+#define BOOKE206_PAGES_NR   (BOOKE206_PAGES_SPAN >> 12)   /* 4 KiB pages */
+
+typedef struct Booke206Pages {
+    uint64_t bits[BOOKE206_PAGES_NR / 64];
+} Booke206Pages;
+
 /* possible TLB variants */
 #define TLB_NONE               0
 #define TLB_6XX                1
@@ -1335,6 +1350,15 @@ struct CPUArchState {
     int nb_pids;     /* Number of available PID registers */
     int tlb_type;    /* Type of TLB we're dealing with */
     ppc_tlb_t tlb;   /* TLB is optional. Allocate them only if needed */
+    /*
+     * Book E 2.06: for each softmmu index, the guest TLB slots a page
+     * cached under it may have been translated through, as a bitmap of
+     * slot number modulo 64.  A tlbwe only has to throw a softmmu index
+     * away when the slot it overwrites is marked here; an aliased slot
+     * costs one flush that was not needed, never a missed one.
+     */
+    uint64_t booke206_filled[PPC_TLB_EPID_STORE + 1];
+    Booke206Pages *booke206_pages;  /* one per slot, sized with tlb.tlbm */
 #ifdef CONFIG_KVM
     bool tlb_dirty;  /* Set to non-zero when modifying TLB */
     bool kvm_sw_tlb; /* non-zero if KVM SW TLB API is active */
@@ -1963,6 +1987,9 @@ void ppc_compat_add_property(Object *obj, const char *name,
 #define SPR_BOOKE_GIVOR8      (0x1BB)
 #define SPR_BOOKE_GIVOR13     (0x1BC)
 #define SPR_BOOKE_GIVOR14     (0x1BD)
+#define SPR_BOOKE_TENSR       (0x1B5)
+#define SPR_BOOKE_TENS        (0x1B6)
+#define SPR_BOOKE_TENC        (0x1B7)
 #define SPR_TIR               (0x1BE)
 #define SPR_UHDEXCR           (0x1C7)
 #define SPR_PTCR              (0x1D0)
@@ -2335,7 +2362,9 @@ void ppc_compat_add_property(Object *obj, const char *name,
 #define SPR_750FX_HID2        (0x3F8)
 #define SPR_Exxx_L1FINV0      (0x3F8)
 #define SPR_L2CR              (0x3F9)
+#define SPR_Exxx_L2CFG0       (0x207)
 #define SPR_Exxx_L2CSR0       (0x3F9)
+#define SPR_Exxx_L2CSR1       (0x3FA)
 #define SPR_L3CR              (0x3FA)
 #define SPR_750_TDCH          (0x3FA)
 #define SPR_IABR2             (0x3FA)

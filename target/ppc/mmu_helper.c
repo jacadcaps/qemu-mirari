@@ -37,6 +37,7 @@
 #include "mmu-booke.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
+#include "accel/tcg/cpu-loop.h"
 
 /* #define FLUSH_ALL_TLBS */
 
@@ -121,6 +122,30 @@ static inline void ppc4xx_tlb_invalidate_all(CPUPPCState *env)
     tlb_flush(env_cpu(env));
 }
 
+/*
+ * Everything a softmmu index held is gone, so nothing in it can have come
+ * from a guest TLB slot any more.  Only ever called for the CPU running
+ * this code: leaving another CPU's bitmap alone costs it a flush it did
+ * not need, which is what it would have done before this was tracked.
+ */
+static void booke206_filled_reset(CPUPPCState *env, MMUIdxMap map)
+{
+    int i;
+
+    for (i = 0; i < (int)ARRAY_SIZE(env->booke206_filled); i++) {
+        if (map & (1 << i)) {
+            env->booke206_filled[i] = 0;
+        }
+    }
+}
+
+/* Likewise for the per-slot page records, after a flush of the whole lot. */
+static void booke206_pages_reset(CPUPPCState *env)
+{
+    memset(env->booke206_pages, 0,
+           env->nb_tlb * sizeof(*env->booke206_pages));
+}
+
 static void booke206_flush_tlb(CPUPPCState *env, int flags,
                                const int check_iprot)
 {
@@ -141,6 +166,8 @@ static void booke206_flush_tlb(CPUPPCState *env, int flags,
     }
 
     tlb_flush(env_cpu(env));
+    booke206_filled_reset(env, UINT32_MAX);
+    booke206_pages_reset(env);
 }
 
 /*****************************************************************************/
@@ -1010,12 +1037,186 @@ void helper_booke_set_epsc(CPUPPCState *env, target_ulong val)
     tlb_flush_by_mmuidx(env_cpu(env), 1 << PPC_TLB_EPID_STORE);
 }
 
-static inline void flush_page(CPUPPCState *env, ppcmas_tlb_t *tlb)
+/*
+ * The MMU indexes a Book E entry can be cached under.  hreg_compute_hflags()
+ * encodes AS in bit 1 of the index (MSR[IS] for fetches, MSR[DS] for data,
+ * and MSR_IS and MSR_DS are the bits mmubooke206_check_tlb() compares against
+ * MAS1[TS]), so an entry for one address space can never be cached under an
+ * index for the other.  The two external-PID indexes carry their own AS in
+ * EPLC/EPSC[EAS].
+ */
+static MMUIdxMap booke206_tlb_mmuidx_map(CPUPPCState *env, ppcmas_tlb_t *tlb)
 {
-    if (booke206_tlb_to_page_size(env, tlb) == TARGET_PAGE_SIZE) {
-        tlb_flush_page(env_cpu(env), tlb->mas2 & MAS2_EPN_MASK);
+    bool ts = !!(tlb->mas1 & MAS1_TS);
+    /* 0..7 are (GS << 2) | (AS << 1) | PR; keep every index whose AS matches */
+    MMUIdxMap map = ts ? 0xcc : 0x33;
+
+    if (!!(env->spr[SPR_BOOKE_EPLC] & EPID_EAS) == ts) {
+        map |= 1 << PPC_TLB_EPID_LOAD;
+    }
+    if (!!(env->spr[SPR_BOOKE_EPSC] & EPID_EAS) == ts) {
+        map |= 1 << PPC_TLB_EPID_STORE;
+    }
+    return map;
+}
+
+/*
+ * What a Book E entry leaving the TLB costs the softmmu.  Only the pages the
+ * softmmu actually translated through the slot can go stale, and
+ * booke206_pages[slot] names them, so flushing those leaves the entries for
+ * the other 63 TLB1 slots -- which is most of the index -- in place.
+ *
+ * Past this many pages the whole index is cheaper, and it is all that was
+ * ever possible for a large entry: tlb_flush_range_locked() falls back to a
+ * whole-index flush for any range longer than the softmmu table
+ * (accel/tcg/cputlb.c), and then clears the jump cache a page at a time for
+ * ranges below 16 MiB -- a loop that measured 42 % of the vCPU on a browser
+ * workload against 16 % for clearing the jump cache outright.
+ */
+#define BOOKE206_PAGES_MAX 16
+
+typedef struct BookeFlush {
+    MMUIdxMap idxmap;           /* the indexes the entry's AS can reach */
+    target_ulong epn;
+    bool oversized;             /* too large for the page record to describe */
+} BookeFlush;
+
+static BookeFlush booke206_flush_of(CPUPPCState *env, ppcmas_tlb_t *tlb)
+{
+    /*
+     * An invalid entry starts out "oversized": nothing can have been
+     * translated through it, so its record should be empty, and if some
+     * path has left something in it the record cannot be trusted to be
+     * relative to this entry's EPN.
+     */
+    BookeFlush f = { 0, 0, true };
+
+    if (tlb->mas1 & MAS1_VALID) {
+        f.idxmap = booke206_tlb_mmuidx_map(env, tlb);
+        f.epn = tlb->mas2 & MAS2_EPN_MASK;
+        f.oversized =
+            booke206_tlb_to_page_size(env, tlb) > BOOKE206_PAGES_SPAN;
+    }
+    return f;
+}
+
+/*
+ * Issue the flush for a slot that is being overwritten: @a is what it held,
+ * @b what it now holds.  Both are the same slot, so both are covered by the
+ * one page record -- anything the softmmu holds for @b's range that is stale
+ * was translated through @a, or through a second valid entry for the same
+ * address, which is a guest error the hardware does not define either.
+ */
+static void booke206_flush(CPUPPCState *env, int slot,
+                           BookeFlush a, BookeFlush b)
+{
+    CPUState *cs = env_cpu(env);
+    Booke206Pages *rec = &env->booke206_pages[slot];
+    uint64_t held = 1ULL << (slot & 63);
+    MMUIdxMap live = 0;
+    int i, n = 0;
+
+    for (i = 0; i < (int)ARRAY_SIZE(env->booke206_filled); i++) {
+        if (env->booke206_filled[i] & held) {
+            live |= 1 << i;
+        }
+    }
+    live &= a.idxmap | b.idxmap;
+
+    for (i = 0; i < (int)ARRAY_SIZE(rec->bits); i++) {
+        n += ctpop64(rec->bits[i]);
+    }
+
+    if (!n || !live) {
+        /* nothing the softmmu took through this slot is still in it */
+    } else if (!a.oversized && n <= BOOKE206_PAGES_MAX) {
+        /*
+         * Every page in the record was translated while @a held the slot, so
+         * it lies within @a's own megabyte and @a's EPN supplies the address
+         * bits the record does not carry.
+         */
+        target_ulong base = a.epn & ~(target_ulong)(BOOKE206_PAGES_SPAN - 1);
+
+        for (i = 0; i < (int)ARRAY_SIZE(rec->bits); i++) {
+            uint64_t left = rec->bits[i];
+
+            while (left) {
+                int k = ctz64(left);
+
+                left &= left - 1;
+                tlb_flush_page_by_mmuidx(cs, base + (target_ulong)
+                                         ((i << 6) + k) * TARGET_PAGE_SIZE,
+                                         live);
+            }
+        }
+        /*
+         * The index bitmap is only precise to the slot number modulo 64, so
+         * another slot may be holding these bits up; leave them, and let the
+         * next whole-index flush clear them.  They only ever cost a lookup.
+         */
     } else {
-        tlb_flush(env_cpu(env));
+        tlb_flush_by_mmuidx(cs, live);
+        booke206_filled_reset(env, live);
+    }
+
+    memset(rec, 0, sizeof(*rec));
+}
+
+/*
+ * Two valid entries that translate the same address are a programming error
+ * on the e500 family and undefined on the hardware; here the first one found
+ * would silently win.  Only looked for when guest errors are being logged.
+ */
+static void __attribute__((noinline, cold))
+booke206_check_overlap(CPUPPCState *env, ppcmas_tlb_t *nt,
+                       uintptr_t ra)
+{
+    target_ulong nsize = booke206_tlb_to_page_size(env, nt);
+    target_ulong nepn = nt->mas2 & MAS2_EPN_MASK & ~(nsize - 1);
+    uint32_t ntid = nt->mas1 & MAS1_TID_MASK;
+    ppcmas_tlb_t *tlb = env->tlb.tlbm;
+    int ntlbn = booke206_tlbm_to_tlbn(env, nt);
+    int nesel = booke206_tlbm_id(env, nt);
+    bool restored = false;
+    int i, j;
+
+    for (i = 0; i < ntlbn; i++) {
+        nesel -= booke206_tlb_size(env, i);
+    }
+
+    for (i = 0; i < BOOKE206_MAX_TLBN; i++) {
+        int n = booke206_tlb_size(env, i);
+
+        for (j = 0; j < n; j++, tlb++) {
+            target_ulong size, epn;
+            uint32_t tid;
+
+            if (tlb == nt || !(tlb->mas1 & MAS1_VALID) ||
+                ((tlb->mas1 ^ nt->mas1) & MAS1_TS)) {
+                continue;
+            }
+            tid = tlb->mas1 & MAS1_TID_MASK;
+            if (tid && ntid && tid != ntid) {
+                continue;
+            }
+            size = booke206_tlb_to_page_size(env, tlb);
+            epn = tlb->mas2 & MAS2_EPN_MASK & ~(size - 1);
+            if (epn >= nepn + nsize || nepn >= epn + size) {
+                continue;
+            }
+            if (!restored) {
+                cpu_restore_state(env_cpu(env), ra);
+                restored = true;
+            }
+            qemu_log_mask(LOG_GUEST_ERROR, "tlbwe at 0x" TARGET_FMT_lx
+                          ": TLB%d[%d] EA 0x" TARGET_FMT_lx " size 0x"
+                          TARGET_FMT_lx " TS %d TID %d overlaps TLB%d[%d] EA 0x"
+                          TARGET_FMT_lx " size 0x" TARGET_FMT_lx " TID %d\n",
+                          env->nip, ntlbn, nesel, nepn, nsize,
+                          !!(nt->mas1 & MAS1_TS), ntid >> MAS1_TID_SHIFT,
+                          i, j, epn, size,
+                          tid >> MAS1_TID_SHIFT);
+        }
     }
 }
 
@@ -1025,6 +1226,7 @@ void helper_booke206_tlbwe(CPUPPCState *env)
     ppcmas_tlb_t *tlb;
     uint32_t size_tlb, size_ps;
     target_ulong mask;
+    BookeFlush victim;
 
 
     switch (env->spr[SPR_BOOKE_MAS0] & MAS0_WQ_MASK) {
@@ -1077,21 +1279,20 @@ void helper_booke206_tlbwe(CPUPPCState *env)
         cpu_abort(env_cpu(env), "missing HV implementation\n");
     }
 
-    if (tlb->mas1 & MAS1_VALID) {
-        /*
-         * Invalidate the page in QEMU TLB if it was a valid entry.
-         *
-         * In "PowerPC e500 Core Family Reference Manual, Rev. 1",
-         * Section "12.4.2 TLB Write Entry (tlbwe) Instruction":
-         * (https://www.nxp.com/docs/en/reference-manual/E500CORERM.pdf)
-         *
-         * "Note that when an L2 TLB entry is written, it may be displacing an
-         * already valid entry in the same L2 TLB location (a victim). If a
-         * valid L1 TLB entry corresponds to the L2 MMU victim entry, that L1
-         * TLB entry is automatically invalidated."
-         */
-        flush_page(env, tlb);
-    }
+    /*
+     * Note what the victim costs the softmmu, and flush it together with the
+     * new entry below.
+     *
+     * In "PowerPC e500 Core Family Reference Manual, Rev. 1",
+     * Section "12.4.2 TLB Write Entry (tlbwe) Instruction":
+     * (https://www.nxp.com/docs/en/reference-manual/E500CORERM.pdf)
+     *
+     * "Note that when an L2 TLB entry is written, it may be displacing an
+     * already valid entry in the same L2 TLB location (a victim). If a
+     * valid L1 TLB entry corresponds to the L2 MMU victim entry, that L1
+     * TLB entry is automatically invalidated."
+     */
+    victim = booke206_flush_of(env, tlb);
 
     tlb->mas7_3 = ((uint64_t)env->spr[SPR_BOOKE_MAS7] << 32) |
         env->spr[SPR_BOOKE_MAS3];
@@ -1129,7 +1330,13 @@ void helper_booke206_tlbwe(CPUPPCState *env)
         tlb->mas1 &= ~MAS1_IPROT;
     }
 
-    flush_page(env, tlb);
+    if (unlikely(qemu_loglevel_mask(LOG_GUEST_ERROR)) &&
+        (tlb->mas1 & MAS1_VALID)) {
+        booke206_check_overlap(env, tlb, GETPC());
+    }
+
+    booke206_flush(env, booke206_tlbm_id(env, tlb), victim,
+                   booke206_flush_of(env, tlb));
 }
 
 static inline void booke206_tlb_to_mas(CPUPPCState *env, ppcmas_tlb_t *tlb)
@@ -1213,8 +1420,17 @@ void helper_booke206_tlbsx(CPUPPCState *env, target_ulong address)
     env->spr[SPR_BOOKE_MAS0] |= env->last_way << MAS0_NV_SHIFT;
 }
 
-static inline void booke206_invalidate_ea_tlb(CPUPPCState *env, int tlbn,
-                                              vaddr ea)
+/* Invalidate one entry, flushing only what the softmmu took through it. */
+static void booke206_invalidate_slot(CPUPPCState *env, ppcmas_tlb_t *tlb)
+{
+    BookeFlush victim = booke206_flush_of(env, tlb);
+
+    tlb->mas1 &= ~MAS1_VALID;
+    booke206_flush(env, booke206_tlbm_id(env, tlb), victim,
+                   booke206_flush_of(env, tlb));
+}
+
+static void booke206_invalidate_ea_tlb(CPUPPCState *env, int tlbn, vaddr ea)
 {
     int i;
     int ways = booke206_tlb_ways(env, tlbn);
@@ -1222,45 +1438,60 @@ static inline void booke206_invalidate_ea_tlb(CPUPPCState *env, int tlbn,
 
     for (i = 0; i < ways; i++) {
         ppcmas_tlb_t *tlb = booke206_get_tlbm(env, tlbn, ea, i);
-        if (!tlb) {
+        if (!tlb || !(tlb->mas1 & MAS1_VALID)) {
             continue;
         }
         mask = ~(booke206_tlb_to_page_size(env, tlb) - 1);
         if (((tlb->mas2 & MAS2_EPN_MASK) == (ea & mask)) &&
             !(tlb->mas1 & MAS1_IPROT)) {
-            tlb->mas1 &= ~MAS1_VALID;
+            booke206_invalidate_slot(env, tlb);
         }
     }
 }
 
-void helper_booke206_tlbivax(CPUPPCState *env, target_ulong address)
+static void booke206_tlbivax_local(CPUPPCState *env, target_ulong address)
 {
-    CPUState *cs;
-
     if (address & 0x4) {
-        /* flush all entries */
+        /* flush all of TLB1 or of TLB0 */
         if (address & 0x8) {
-            /* flush all of TLB1 */
             booke206_flush_tlb(env, BOOKE206_FLUSH_TLB1, 1);
         } else {
-            /* flush all of TLB0 */
             booke206_flush_tlb(env, BOOKE206_FLUSH_TLB0, 0);
         }
-        return;
-    }
-
-    if (address & 0x8) {
-        /* flush TLB1 entries */
-        booke206_invalidate_ea_tlb(env, 1, address);
-        CPU_FOREACH(cs) {
-            tlb_flush(cs);
-        }
     } else {
-        /* flush TLB0 entries */
-        booke206_invalidate_ea_tlb(env, 0, address);
-        CPU_FOREACH(cs) {
-            tlb_flush_page(cs, address & MAS2_EPN_MASK);
+        booke206_invalidate_ea_tlb(env, address & 0x8 ? 1 : 0, address);
+    }
+}
+
+static void booke206_tlbivax_work(CPUState *cs, run_on_cpu_data data)
+{
+    booke206_tlbivax_local(cpu_env(cs), data.target_ptr);
+}
+
+/*
+ * tlbivax is broadcast: every processor drops the matching entries.  Each
+ * vCPU edits its own array in its own thread; the issuer's part runs as safe
+ * work, after the others', and the translator ends the TB so that it does so
+ * before the next instruction (as tlb_flush_page_all_cpus_synced()).
+ */
+void helper_booke206_tlbivax(CPUPPCState *env, target_ulong address)
+{
+    CPUState *src = env_cpu(env);
+    CPUState *cs;
+    bool shared = false;
+
+    CPU_FOREACH(cs) {
+        if (cs != src) {
+            async_run_on_cpu(cs, booke206_tlbivax_work,
+                             RUN_ON_CPU_TARGET_PTR(address));
+            shared = true;
         }
+    }
+    if (shared) {
+        async_safe_run_on_cpu(src, booke206_tlbivax_work,
+                              RUN_ON_CPU_TARGET_PTR(address));
+    } else {
+        booke206_tlbivax_local(env, address);
     }
 }
 
@@ -1289,6 +1520,8 @@ void helper_booke206_tlbilx1(CPUPPCState *env, target_ulong address)
         tlb += booke206_tlb_size(env, i);
     }
     tlb_flush(env_cpu(env));
+    booke206_filled_reset(env, UINT32_MAX);
+    booke206_pages_reset(env);
 }
 
 void helper_booke206_tlbilx3(CPUPPCState *env, target_ulong address)
@@ -1329,6 +1562,8 @@ void helper_booke206_tlbilx3(CPUPPCState *env, target_ulong address)
         }
     }
     tlb_flush(env_cpu(env));
+    booke206_filled_reset(env, UINT32_MAX);
+    booke206_pages_reset(env);
 }
 
 void helper_booke206_tlbflush(CPUPPCState *env, target_ulong type)

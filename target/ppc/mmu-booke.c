@@ -25,6 +25,9 @@
 #include "internal.h"
 #include "mmu-booke.h"
 
+/* booke206_pages indexes its bitmap by bits 19:12 of the effective address */
+QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != 12);
+
 /* Generic TLB check function for embedded PowerPC implementations */
 static bool ppcemb_tlb_check(CPUPPCState *env, ppcemb_tlb_t *tlb,
                              hwaddr *raddrp,
@@ -306,59 +309,106 @@ static bool mmubooke206_get_as(CPUPPCState *env,
     }
 }
 
-/* Check if the tlb found by hashing really matches */
-static int mmubooke206_check_tlb(CPUPPCState *env, ppcmas_tlb_t *tlb,
-                                 hwaddr *raddr, int *prot,
-                                 target_ulong address,
-                                 MMUAccessType access_type, int mmu_idx)
+/*
+ * The part of a Book E TLB lookup that does not vary from one way to the
+ * next.  A TLB1 miss walks every way, so anything recomputed inside that
+ * loop is paid 64 times over.
+ */
+typedef struct Booke206Lookup {
+    target_ulong address;       /* EA, truncated in 32-bit mode */
+    uint32_t pid[3];            /* PID, PID1, PID2, or the external PID */
+    int npid;
+    bool as;
+    bool pr;
+} Booke206Lookup;
+
+static void mmubooke206_lookup_init(CPUPPCState *env, Booke206Lookup *l,
+                                    target_ulong address,
+                                    MMUAccessType access_type, int mmu_idx)
 {
     uint32_t epid;
-    bool as, pr;
-    bool use_epid = mmubooke206_get_as(env, mmu_idx, &epid, &as, &pr);
+    bool use_epid = mmubooke206_get_as(env, mmu_idx, &epid, &l->as, &l->pr);
 
-    if (!use_epid) {
-        if (ppcmas_tlb_check(env, tlb, raddr, address,
-                             env->spr[SPR_BOOKE_PID]) >= 0) {
-            goto found_tlb;
-        }
+    if (!FIELD_EX64(env->msr, MSR, CM)) {
+        /* In 32bit mode we can only address 32bit EAs */
+        address = (uint32_t)address;
+    }
+    l->address = address;
 
-        if (env->spr[SPR_BOOKE_PID1] &&
-            ppcmas_tlb_check(env, tlb, raddr, address,
-                             env->spr[SPR_BOOKE_PID1]) >= 0) {
-            goto found_tlb;
-        }
-
-        if (env->spr[SPR_BOOKE_PID2] &&
-            ppcmas_tlb_check(env, tlb, raddr, address,
-                             env->spr[SPR_BOOKE_PID2]) >= 0) {
-            goto found_tlb;
-        }
+    l->npid = 0;
+    if (use_epid) {
+        l->pid[l->npid++] = epid;
     } else {
-        if (ppcmas_tlb_check(env, tlb, raddr, address, epid) >= 0) {
-            goto found_tlb;
+        l->pid[l->npid++] = env->spr[SPR_BOOKE_PID];
+        if (env->spr[SPR_BOOKE_PID1]) {
+            l->pid[l->npid++] = env->spr[SPR_BOOKE_PID1];
+        }
+        if (env->spr[SPR_BOOKE_PID2]) {
+            l->pid[l->npid++] = env->spr[SPR_BOOKE_PID2];
         }
     }
 
-    qemu_log_mask(CPU_LOG_MMU, "%s: No TLB entry found for effective address "
-                  "0x" TARGET_FMT_lx "\n", __func__, address);
-    return -1;
-
-found_tlb:
-
-    /* Check the address space and permissions */
     if (access_type == MMU_INST_FETCH) {
         /* There is no way to fetch code using epid load */
         assert(!use_epid);
-        as = FIELD_EX64(env->msr, MSR, IR);
+        l->as = FIELD_EX64(env->msr, MSR, IR);
+    }
+}
+
+/* Check if the tlb found by hashing really matches */
+static int mmubooke206_check_tlb(CPUPPCState *env, ppcmas_tlb_t *tlb,
+                                 const Booke206Lookup *l, hwaddr *raddr,
+                                 int *prot, MMUAccessType access_type)
+{
+    target_ulong address = l->address;
+    uint32_t tlb_pid;
+    hwaddr mask;
+    int i;
+
+    /* Check valid flag */
+    if (!(tlb->mas1 & MAS1_VALID)) {
+        return -1;
     }
 
-    if (as != ((tlb->mas1 & MAS1_TS) >> MAS1_TS_SHIFT)) {
+    /*
+     * Check the effective address before the TID: on a fully associative
+     * TLB1 walk it is the test that rejects every way but one, and most
+     * entries are global (TID 0) so the TID test rejects nothing.
+     */
+    mask = ~(booke206_tlb_to_page_size(env, tlb) - 1);
+    if ((address & mask) != (tlb->mas2 & MAS2_EPN_MASK)) {
+        return -1;
+    }
+
+    /* Check PID */
+    tlb_pid = (tlb->mas1 & MAS1_TID_MASK) >> MAS1_TID_SHIFT;
+    if (tlb_pid != 0) {
+        for (i = 0; i < l->npid; i++) {
+            if (tlb_pid == l->pid[i]) {
+                break;
+            }
+        }
+        if (i == l->npid) {
+            return -1;
+        }
+    }
+
+    qemu_log_mask(CPU_LOG_MMU, "%s: TLB ADDR=0x" TARGET_FMT_lx
+                  " MAS1=0x%x MAS2=0x%" PRIx64 " mask=0x%"
+                  HWADDR_PRIx " MAS7_3=0x%" PRIx64 " MAS8=0x%" PRIx32 "\n",
+                  __func__, address, tlb->mas1, tlb->mas2, mask,
+                  tlb->mas7_3, tlb->mas8);
+
+    /* Check the address space and permissions */
+    if (l->as != ((tlb->mas1 & MAS1_TS) >> MAS1_TS_SHIFT)) {
         qemu_log_mask(CPU_LOG_MMU, "%s: AS doesn't match\n", __func__);
         return -1;
     }
 
+    *raddr = (tlb->mas7_3 & mask) | (address & ~mask);
+
     *prot = 0;
-    if (pr) {
+    if (l->pr) {
         if (tlb->mas7_3 & MAS3_UR) {
             *prot |= PAGE_READ;
         }
@@ -393,22 +443,57 @@ static int mmubooke206_get_physical_address(CPUPPCState *env, hwaddr *raddr,
                                             MMUAccessType access_type,
                                             int mmu_idx)
 {
-    ppcmas_tlb_t *tlb;
-    int i, j, ret = -1;
+    Booke206Lookup l;
+    int i, base = 0, ret = -1;
+
+    mmubooke206_lookup_init(env, &l, address, access_type, mmu_idx);
 
     for (i = 0; i < BOOKE206_MAX_TLBN; i++) {
+        int size = booke206_tlb_size(env, i);
         int ways = booke206_tlb_ways(env, i);
+        ppcmas_tlb_t *set;
+        int j, first;
+
+        if (size == 0 || ways == 0) {
+            base += size;
+            continue;
+        }
+
+        /*
+         * The set booke206_get_tlbm() would pick, hoisted out of the way
+         * loop: it depends on the EA and the TLB geometry, not on the way,
+         * so the ways of one TLB are adjacent and can be walked by pointer.
+         */
+        first = ((address >> MAS2_EPN_SHIFT) &
+                 ((1 << (ctz32(size) - ctz32(ways))) - 1)) << ctz32(ways);
+        if (first + ways > size) {
+            base += size;
+            continue;
+        }
+        set = &env->tlb.tlbm[base + first];
+
         for (j = 0; j < ways; j++) {
-            tlb = booke206_get_tlbm(env, i, address, j);
-            if (!tlb) {
-                continue;
-            }
-            ret = mmubooke206_check_tlb(env, tlb, raddr, prot, address,
-                                        access_type, mmu_idx);
+            ret = mmubooke206_check_tlb(env, &set[j], &l, raddr, prot,
+                                        access_type);
             if (ret != -1) {
+                /*
+                 * Note the slot, and the page within it, that this index may
+                 * now hold a translation from, so that a tlbwe overwriting
+                 * some other slot can leave the index alone and one
+                 * overwriting this slot can flush just these pages.  The
+                 * address is the one tlb_set_page() will use: the translator
+                 * narrows effective addresses to 32 bits in 32-bit mode, so
+                 * l.address only ever differs from it above bit 31.
+                 */
+                int slot = base + first + j;
+
+                env->booke206_filled[mmu_idx] |= 1ULL << (slot & 63);
+                env->booke206_pages[slot].bits[(address >> 18) & 3] |=
+                    1ULL << ((address >> 12) & 63);
                 goto found_tlb;
             }
         }
+        base += size;
     }
 
 found_tlb:

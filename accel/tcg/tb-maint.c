@@ -191,6 +191,16 @@ struct PageDesc {
     QemuSpin lock;
     /* list of TBs intersecting this ram page */
     uintptr_t first_tb;
+    /*
+     * Smallest and largest address in this page covered by a TB on that
+     * list, as a fast reject for writes that land nowhere near any
+     * translated code.  Widened as TBs are added and reset when the page
+     * goes from having no TBs to having one; never narrowed otherwise, so
+     * the range is conservative and a write outside it is guaranteed to
+     * overlap nothing.  Only meaningful while first_tb != 0.
+     */
+    tb_page_addr_t code_lo;
+    tb_page_addr_t code_hi;
 };
 
 void page_table_config_init(void)
@@ -639,10 +649,24 @@ static struct page_collection *page_collection_lock(tb_page_addr_t start,
         }
         assert_page_locked(pd);
         PAGE_FOR_EACH_TB(unused, unused, pd, tb, n) {
-            if (page_trylock_add(set, tb_page_addr0(tb)) ||
-                (tb_page_addr1(tb) != -1 &&
-                 page_trylock_add(set, tb_page_addr1(tb)))) {
+            tb_page_addr_t a0 = tb_page_addr0(tb);
+            tb_page_addr_t a1 = tb_page_addr1(tb);
+
+            /*
+             * Every TB on this page has @index as one of its two pages,
+             * and @index is already in the set, so page_trylock_add()
+             * would only look it up and return "not busy".  Only the
+             * other page of a TB that straddles a page boundary can add
+             * anything, and those are rare: skip the lookup otherwise.
+             */
+            if ((a0 >> TARGET_PAGE_BITS) != index &&
+                page_trylock_add(set, a0)) {
                 /* drop all locks, and reacquire in order */
+                q_tree_foreach(set->tree, page_entry_unlock, NULL);
+                goto retry;
+            }
+            if (a1 != -1 && (a1 >> TARGET_PAGE_BITS) != index &&
+                page_trylock_add(set, a1)) {
                 q_tree_foreach(set->tree, page_entry_unlock, NULL);
                 goto retry;
             }
@@ -699,6 +723,7 @@ static void tb_remove_all(void)
 static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
 {
     bool page_already_protected;
+    tb_page_addr_t lo, hi;
 
     assert_page_locked(p);
 
@@ -707,12 +732,30 @@ static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
     p->first_tb = (uintptr_t)tb | n;
 
     /*
+     * The part of this page the TB covers; same range computation as
+     * tb_invalidate_phys_page_range__locked().
+     */
+    lo = tb_page_addr0(tb);
+    hi = lo + tb->size - 1;
+    if (n == 0) {
+        hi = MIN(hi, lo | ~TARGET_PAGE_MASK);
+    } else {
+        lo = tb_page_addr1(tb);
+        hi = lo + (hi & ~TARGET_PAGE_MASK);
+    }
+
+    /*
      * If some code is already present, then the pages are already
      * protected. So we handle the case where only the first TB is
      * allocated in a physical page.
      */
     if (!page_already_protected) {
+        p->code_lo = lo;
+        p->code_hi = hi;
         tlb_protect_code(tb->page_addr[n] & TARGET_PAGE_MASK);
+    } else {
+        p->code_lo = MIN(p->code_lo, lo);
+        p->code_hi = MAX(p->code_hi, hi);
     }
 }
 
@@ -1162,7 +1205,17 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
     }
 
     if (unlikely(current_tb_modified)) {
-        page_collection_unlock(pages);
+        /*
+         * Execution is about to leave through cpu_loop_exit_noexc(), so
+         * whatever the caller locked has to be released here rather than on
+         * the return it will not take.  tb_invalidate_phys_range_fast()
+         * comes in holding this one page and no collection.
+         */
+        if (pages) {
+            page_collection_unlock(pages);
+        } else {
+            page_unlock(p);
+        }
         /* Force execution of one insn next time.  */
         cpu->cflags_next_tb = 1 | CF_NOIRQ | curr_cflags(cpu);
         cpu_loop_exit_noexc(cpu);
@@ -1210,16 +1263,58 @@ void tb_invalidate_phys_range(CPUState *cpu, tb_page_addr_t start,
 void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
                                    unsigned len, uintptr_t ra)
 {
-    PageDesc *p = page_find(start >> TARGET_PAGE_BITS);
+    tb_page_addr_t index = start >> TARGET_PAGE_BITS;
+    PageDesc *p = page_find(index);
+    struct page_collection *pages;
+    TranslationBlock *tb;
+    PageForEachNext n;
+    ram_addr_t last;
+    bool straddles = false;
 
-    if (p) {
-        ram_addr_t last = start + len - 1;
-        struct page_collection *pages = page_collection_lock(start, last);
-
-        tb_invalidate_phys_page_range__locked(cpu, pages, p,
-                                              start, last, ra);
-        page_collection_unlock(pages);
+    if (!p) {
+        return;
     }
+    last = start + len - 1;
+
+    page_lock(p);
+
+    /*
+     * This runs on every guest store to a page that holds translated code,
+     * which for a guest running its own JIT means most stores it makes into
+     * its code buffer -- and those overwhelmingly land on the data part of
+     * a page whose code part is elsewhere.  Reject those against the page's
+     * code range before touching the TB list at all.
+     */
+    if (last < p->code_lo || start > p->code_hi) {
+        page_unlock(p);
+        return;
+    }
+
+    /*
+     * The write cannot cross a page (len <= 8 and start is aligned to it),
+     * so the page collection is this one page alone unless some TB on it
+     * straddles a page boundary.  Only then is the tree, its three
+     * allocations and its lookup per TB on the page worth building.
+     */
+    PAGE_FOR_EACH_TB(unused, unused, p, tb, n) {
+        tb_page_addr_t a1 = tb_page_addr1(tb);
+
+        if ((tb_page_addr0(tb) >> TARGET_PAGE_BITS) != index ||
+            (a1 != -1 && (a1 >> TARGET_PAGE_BITS) != index)) {
+            straddles = true;
+            break;
+        }
+    }
+    if (!straddles) {
+        tb_invalidate_phys_page_range__locked(cpu, NULL, p, start, last, ra);
+        page_unlock(p);
+        return;
+    }
+    page_unlock(p);
+
+    pages = page_collection_lock(start, last);
+    tb_invalidate_phys_page_range__locked(cpu, pages, p, start, last, ra);
+    page_collection_unlock(pages);
 }
 
 #endif /* CONFIG_USER_ONLY */

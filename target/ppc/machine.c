@@ -299,6 +299,16 @@ static int cpu_post_load(void *opaque, int version_id)
 
     post_load_update_msr(env);
 
+    /*
+     * The softmmu on this side is empty, so nothing in it can be stale for
+     * a Book E guest TLB slot.
+     */
+    memset(env->booke206_filled, 0, sizeof(env->booke206_filled));
+    if (env->booke206_pages) {
+        memset(env->booke206_pages, 0,
+               env->nb_tlb * sizeof(*env->booke206_pages));
+    }
+
     if (tcg_enabled()) {
         /* Re-set breaks based on regs */
 #if defined(TARGET_PPC64)

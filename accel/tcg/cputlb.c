@@ -150,16 +150,14 @@ static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
 static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
-    int i, i0;
 
     if (unlikely(!jc)) {
         return;
     }
 
-    i0 = tb_jmp_cache_hash_page(page_addr);
-    for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
-        qatomic_set(&jc->array[i0 + i].tb, NULL);
-    }
+    /* One page's translations are one run of the cache; retire it. */
+    tb_jmp_cache_retire(jc, tb_jmp_cache_hash_page(page_addr) >>
+                            TB_JMP_CACHE_PAGE_BITS);
 }
 
 /**
@@ -391,7 +389,13 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    tcg_flush_jmp_cache(cpu);
+    /*
+     * Nothing left the softmmu if no index was dirty, so nothing the jump
+     * cache holds can have gone stale with it.
+     */
+    if (to_clean) {
+        tcg_flush_jmp_cache(cpu);
+    }
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
@@ -488,9 +492,13 @@ static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
 
     assert_cpu_is_self(cpu);
     for (k = 0; k < CPU_VTLB_SIZE; k++) {
-        if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
-            tlb_n_used_entries_dec(cpu, mmu_idx);
-        }
+        /*
+         * Do not account for this one.  n_used_entries counts the main
+         * table only: tlb_set_page_full() decrements it when it moves an
+         * entry out to the victim table, so a victim entry has already been
+         * subtracted and must not be subtracted again when it is flushed.
+         */
+        tlb_flush_entry_mask_locked(&d->vtable[k], page, mask);
     }
 }
 

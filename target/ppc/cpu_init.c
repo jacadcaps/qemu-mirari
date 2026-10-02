@@ -2888,8 +2888,12 @@ static void init_proc_e500(CPUPPCState *env, int version)
         l1cfg1 |= 0x1000000; /* 64 byte cache block size */
         break;
     case fsl_e6500:
-        env->dcache_line_size = 32;
-        env->icache_line_size = 32;
+        /*
+         * 64-byte cache blocks, as the L1CFG0/L1CFG1 CBSIZE fields below
+         * say (e6500 Core Reference Manual 1.2); dcbz zeroes one block.
+         */
+        env->dcache_line_size = 64;
+        env->icache_line_size = 64;
         l1cfg0 |= 0x0F83820;
         l1cfg1 |= 0x0B83820;
         break;
@@ -2993,6 +2997,15 @@ static void init_proc_e500(CPUPPCState *env, int version)
                      SPR_NOACCESS, SPR_NOACCESS,
                      &spr_read_mas73, &spr_write_mas73,
                      0x00000000);
+        /* Backside L2 configuration/control (e5500: 256 KB, 8 ways) */
+        spr_register(env, SPR_Exxx_L2CFG0, "L2CFG0",
+                     SPR_NOACCESS, SPR_NOACCESS,
+                     &spr_read_generic, SPR_NOACCESS,
+                     0x00020400);
+        spr_register(env, SPR_Exxx_L2CSR1, "L2CSR1",
+                     SPR_NOACCESS, SPR_NOACCESS,
+                     &spr_read_generic, &spr_write_generic,
+                     0x00000000);
         ivpr_mask = (target_ulong)~0xFFFFULL;
     }
 
@@ -3010,6 +3023,24 @@ static void init_proc_e500(CPUPPCState *env, int version)
                      SPR_NOACCESS, SPR_NOACCESS,
                      &spr_read_generic, SPR_NOACCESS,
                      0x7FFFFFFC);
+        /*
+         * Thread enable: only thread 0 of each core exists here, so the
+         * status reads 1 and the set/clear registers are no-ops.
+         */
+        spr_register(env, SPR_BOOKE_TENSR, "TENSR",
+                     SPR_NOACCESS, SPR_NOACCESS,
+                     &spr_read_generic, SPR_NOACCESS,
+                     0x00000001);
+        spr_register(env, SPR_BOOKE_TENS, "TENS",
+                     SPR_NOACCESS, SPR_NOACCESS,
+                     &spr_read_generic, &spr_access_nop,
+                     0x00000001);
+        spr_register(env, SPR_BOOKE_TENC, "TENC",
+                     SPR_NOACCESS, SPR_NOACCESS,
+                     &spr_read_generic, &spr_access_nop,
+                     0x00000001);
+        /* AltiVec (VRSAVE is USPRG0, registered with the Book-E SPRs) */
+        vscr_init(env, 0x00010000);
     }
 
 #if !defined(CONFIG_USER_ONLY)
@@ -3174,7 +3205,7 @@ POWERPC_FAMILY(e5500)(ObjectClass *oc, const void *data)
     pcc->init_proc = init_proc_e5500;
     pcc->check_pow = check_pow_none;
     pcc->check_attn = check_attn_none;
-    pcc->insns_flags = PPC_INSNS_BASE | PPC_ISEL | PPC_MFTB |
+    pcc->insns_flags = PPC_INSNS_BASE | PPC_ISEL | PPC_MFTB | PPC_STRING |
                        PPC_WRTEE | PPC_RFDI | PPC_RFMCI |
                        PPC_CACHE | PPC_CACHE_LOCK | PPC_CACHE_ICBI |
                        PPC_CACHE_DCBZ | PPC_CACHE_DCBA |
@@ -3223,7 +3254,7 @@ POWERPC_FAMILY(e6500)(ObjectClass *oc, const void *data)
     pcc->init_proc = init_proc_e6500;
     pcc->check_pow = check_pow_none;
     pcc->check_attn = check_attn_none;
-    pcc->insns_flags = PPC_INSNS_BASE | PPC_ISEL | PPC_MFTB |
+    pcc->insns_flags = PPC_INSNS_BASE | PPC_ISEL | PPC_MFTB | PPC_STRING |
                        PPC_WRTEE | PPC_RFDI | PPC_RFMCI |
                        PPC_CACHE | PPC_CACHE_LOCK | PPC_CACHE_ICBI |
                        PPC_CACHE_DCBZ | PPC_CACHE_DCBA |
@@ -6893,6 +6924,7 @@ static void init_ppc_proc(PowerPCCPU *cpu)
             break;
         case TLB_MAS:
             env->tlb.tlbm = g_new0(ppcmas_tlb_t, env->nb_tlb);
+            env->booke206_pages = g_new0(Booke206Pages, env->nb_tlb);
             break;
         }
         /* Pre-compute some useful values */

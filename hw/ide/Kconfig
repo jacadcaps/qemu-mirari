@@ -58,6 +58,11 @@ config AHCI_SYSBUS
     bool
     select AHCI
 
+config FSL_SATA
+    bool
+    select IDE_BUS
+    select IDE_DEV
+
 config IDE_SII3112
     bool
     select IDE_PCI

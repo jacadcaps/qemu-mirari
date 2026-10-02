@@ -177,6 +177,24 @@ config MPC8544DS
     depends on PPC && FDT
     select E500
 
+config MIRARI
+    bool
+    default y
+    depends on PPC64
+    select OPENPIC
+    select SERIAL_MM
+    select MPC_I2C
+    select DS1338
+    select AT24C
+    select EMC141X
+    select UNIMP
+    select MIRARI_PEX
+    select FSL_SATA
+    select SM501
+    select LSI_SCSI_PCI
+    select USB_OHCI_PCI
+    select RTL8139_PCI
+
 config VIRTEX
     bool
     default y

@@ -41,6 +41,19 @@ static void pmu_update_summaries(CPUPPCState *env)
     int ins_cnt = 0;
     int cyc_cnt = 0;
 
+    /*
+     * The PMU is a book3s facility, but this runs for every 64-bit CPU:
+     * ppc_cpu_reset_hold() calls pmu_mmcr01a_updated() unconditionally.  On a
+     * CPU that has no MMCR0 - the 64-bit BookE cores, e5500 and e6500 - it
+     * reads back as zero, and a zero MMCR0 means "counters not frozen, PMC5
+     * counting instructions": HFLAGS_INSN_CNT ends up set and every single TB
+     * ends with a load, add and store of an SPR the guest cannot name.  If the
+     * register does not exist, neither does the PMU.
+     */
+    if (!env->spr_cb[SPR_POWER_MMCR0].name) {
+        goto out;
+    }
+
     if (mmcr0 & MMCR0_FC) {
         goto out;
     }

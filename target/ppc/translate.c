@@ -1039,7 +1039,12 @@ void spr_write_pir(DisasContext *ctx, int sprn, int gprn)
 {
     TCGv t0 = tcg_temp_new();
     tcg_gen_andi_tl(t0, cpu_gpr[gprn], 0xF);
-    gen_store_spr(SPR_PIR, t0);
+    /*
+     * PIR is SPR 1023 on the 970/POWER cores but SPR 286 on Book-E
+     * (SPR_BOOKE_PIR), where SPR 1023 is the SVR; store to the SPR
+     * actually addressed.
+     */
+    gen_store_spr(sprn, t0);
 }
 #endif
 
@@ -3717,6 +3722,8 @@ static void gen_tlbivax_booke206(DisasContext *ctx)
     t0 = tcg_temp_new();
     gen_addr_reg_index(ctx, t0);
     gen_helper_booke206_tlbivax(tcg_env, t0);
+    /* the broadcast completes as async work, before the next instruction */
+    ctx->base.is_jmp = DISAS_EXIT_UPDATE;
 #endif /* defined(CONFIG_USER_ONLY) */
 }
 

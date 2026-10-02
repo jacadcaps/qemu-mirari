@@ -23,6 +23,7 @@ pci_ss.add(when: 'CONFIG_GRACKLE_PCI', if_true: files('grackle.c'))
 pci_ss.add(when: 'CONFIG_UNIN_PCI', if_true: files('uninorth.c'))
 # PowerPC E500 boards
 pci_ss.add(when: 'CONFIG_PPCE500_PCI', if_true: files('ppce500.c'))
+pci_ss.add(when: 'CONFIG_MIRARI_PEX', if_true: files('mirari_pex.c'))
 # AmigaOne
 pci_ss.add(when: 'CONFIG_ARTICIA', if_true: files('articia.c'))
 # Pegasos2
