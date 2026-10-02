@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://chromium.googlesource.com/angle/angle
+revision = 52f594287836c9970b67920da0633077aee42649
+patch_directory = angle
+
+[provide]
+egl = angle_egl_dep
+glesv2 = angle_glesv2_dep

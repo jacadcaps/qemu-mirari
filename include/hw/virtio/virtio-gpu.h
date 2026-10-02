@@ -179,6 +179,7 @@ struct VirtIOGPUBaseClass {
     VirtioDeviceClass parent;
 
     void (*gl_flushed)(VirtIOGPUBase *g);
+    void (*gl_force_ctx)(void);
 };
 
 #define VIRTIO_GPU_BASE_PROPERTIES(_state, _conf)                       \

@@ -859,6 +859,19 @@ elif host_os == 'darwin'
   host_dsosuf = '.dylib'
   pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
                    required: get_option('pvg'))
+  # The macOS 27 SDK marks the PGDevice API API_OBSOLETED(), so hw/display/apple-gfx.m
+  # no longer compiles against it.  The framework is still installed and still
+  # links, so the dependency lookup above succeeds; probe the header instead.
+  if pvg.found() and not objc.compiles(
+      '#include <ParavirtualizedGraphics/ParavirtualizedGraphics.h>\n' +
+      'PGTask_t *pvg_probe(void);',
+      dependencies: pvg,
+      name: 'ParavirtualizedGraphics is usable')
+    if get_option('pvg').enabled()
+      error('ParavirtualizedGraphics is obsoleted by the macOS SDK in use')
+    endif
+    pvg = not_found
+  endif
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
             cc.find_library('nsl'),
@@ -1224,7 +1237,7 @@ if get_option('attr').allowed()
 endif
 
 cocoa = dependency('appleframeworks',
-                   modules: ['Cocoa', 'CoreVideo', 'QuartzCore'],
+                   modules: ['Cocoa', 'CoreVideo', 'Metal', 'OpenGL', 'QuartzCore'],
                    required: get_option('cocoa'))
 
 vmnet = dependency('appleframeworks', modules: 'vmnet', required: get_option('vmnet'))
@@ -1417,13 +1430,70 @@ if not get_option('qatzip').auto() or have_system
                       method: 'pkg-config')
 endif
 
+# macOS ships no EGL implementation, and the libepoxy packaged for it is
+# normally built without EGL support, so virtio-gpu-gl cannot work against the
+# system libraries there.  Build the whole GL stack from subprojects/ instead:
+# ANGLE (EGL and GLES over Metal), libepoxy against it, and a matching
+# virglrenderer.  Other platforms keep using their system libraries.
+bundled_gl_stack = get_option('bundled_gl_stack') \
+  .disable_auto_if(host_os != 'darwin') \
+  .allowed()
+
+if bundled_gl_stack
+  # The virglrenderer subproject generates Gallium sources from YAML, and wants
+  # the module present at configure time, so this cannot wait for pyvenv's
+  # build-time groups.
+  run_command(config_host['MKVENV_ENSUREGROUP'].split() +
+              [meson.project_source_root() / 'pythondeps.toml', 'bundled-gl'],
+              check: true)
+endif
+
+# Configured here rather than next to the other GL bits below because both
+# virglrenderer and libepoxy look their own dependencies up, and must see the
+# bundled ones.  Each subproject calls meson.override_dependency(), so
+# instantiating them in dependency order is enough to redirect those lookups:
+# ANGLE publishes 'egl' and 'glesv2' for libepoxy, which publishes 'epoxy' for
+# virglrenderer.
+bundled_epoxy = not_found
+if bundled_gl_stack
+  subproject('angle')
+  bundled_epoxy = subproject('libepoxy',
+                             default_options: {
+                               'egl': 'yes',
+                               'glx': 'no',
+                               'x11': false,
+                               'tests': false,
+                               # Static, so that a system libepoxy pulled in by
+                               # another library - GTK links one - cannot
+                               # interpose on the bundled one at run time.
+                               'default_library': 'static',
+                               # So epoxy opens the ANGLE libraries installed
+                               # alongside it in preference to any others on
+                               # the system, without needing DYLD_LIBRARY_PATH
+                               # set.  Relative to the executable, so that the
+                               # installed tree can still be relocated.
+                               'preferred-libdir': fs.relative_to(
+                                   get_option('prefix') / get_option('libdir'),
+                                   get_option('prefix') / get_option('bindir')),
+                             }).get_variable('libepoxy_dep')
+endif
+
 virgl = not_found
 
 have_vhost_user_gpu = have_tools and host_os == 'linux' and pixman.found()
 if not get_option('virglrenderer').auto() or have_system or have_vhost_user_gpu
-  virgl = dependency('virglrenderer',
-                     method: 'pkg-config',
-                     required: get_option('virglrenderer'))
+  if bundled_gl_stack
+    virgl = subproject('virglrenderer',
+                       default_options: {
+                         'tests': false,
+                         'venus': false,
+                         'default_library': 'static',
+                       }).get_variable('libvirglrenderer_dep')
+  else
+    virgl = dependency('virglrenderer',
+                       method: 'pkg-config',
+                       required: get_option('virglrenderer'))
+  endif
 endif
 rutabaga = not_found
 if not get_option('rutabaga_gfx').auto() or have_system or have_vhost_user_gpu
@@ -1771,14 +1841,21 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
                          required: get_option('coreaudio'))
 endif
 
+egl = not_found
 opengl = not_found
 if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
-  epoxy = dependency('epoxy', method: 'pkg-config',
-                      required: get_option('opengl'))
-  if cc.has_header('epoxy/egl.h', dependencies: epoxy)
-    opengl = epoxy
-  elif get_option('opengl').enabled()
-    error('epoxy/egl.h not found')
+  if bundled_gl_stack
+    opengl = bundled_epoxy
+  else
+    opengl = dependency('epoxy', method: 'pkg-config',
+                        required: get_option('opengl'))
+  endif
+  if bundled_gl_stack
+    # Built with egl=yes just above; cc.has_header() cannot be used to confirm
+    # it because it rejects internal dependencies.
+    egl = opengl
+  elif cc.has_header('epoxy/egl.h', dependencies: opengl)
+    egl = opengl
   endif
 endif
 gbm = not_found
@@ -2481,6 +2558,7 @@ if numa.found()
                        cc.has_function('numa_has_preferred_many',
                                        dependencies: numa))
 endif
+config_host_data.set('CONFIG_EGL', egl.found())
 config_host_data.set('CONFIG_OPENGL', opengl.found())
 config_host_data.set('CONFIG_PLUGIN', get_option('plugins'))
 config_host_data.set('CONFIG_RBD', rbd.found())
@@ -2555,6 +2633,7 @@ config_host_data.set('CONFIG_SPICE_PROTOCOL_MICRO', spice_protocol.version().spl
 endif
 config_host_data.set('CONFIG_SPICE', spice.found())
 config_host_data.set('CONFIG_X11', x11.found())
+config_host_data.set('CONFIG_GTK_X11', gtkx11.found())
 config_host_data.set('CONFIG_DBUS_DISPLAY', dbus_display)
 config_host_data.set('CONFIG_CFI', get_option('cfi'))
 config_host_data.set('CONFIG_SELINUX', selinux.found())
@@ -3271,6 +3350,7 @@ host_kconfig = \
   (libcbor.found() ? ['CONFIG_LIBCBOR=y'] : []) + \
   (gnutls.found() ? ['CONFIG_GNUTLS=y'] : []) + \
   (x11.found() ? ['CONFIG_X11=y'] : []) + \
+  (gtkx11.found() ? ['CONFIG_GTK_X11=y'] : []) + \
   (fdt.found() ? ['CONFIG_FDT=y'] : []) + \
   (have_vhost_user ? ['CONFIG_VHOST_USER=y'] : []) + \
   (have_vhost_vdpa ? ['CONFIG_VHOST_VDPA=y'] : []) + \

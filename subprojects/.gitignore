@@ -6,6 +6,9 @@
 /keycodemapdb
 /libvfio-user
 /slirp
+/angle
+/libepoxy
+/virglrenderer
 /anyhow-*
 /attrs-*
 /bitfield-struct-*
@@ -20,3 +23,7 @@
 
 # Workaround for Meson v1.9.0 https://github.com/mesonbuild/meson/issues/14948
 /.wraplock
+
+# The top-level .gitignore excludes *.patch, but the patches the .wrap files
+# apply to their subprojects are part of the tree, not build output.
+!packagefiles/**/*.patch

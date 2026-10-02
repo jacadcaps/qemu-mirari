@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jacek Piszczek <deepseek_ai@runbox.com>
+Date: Sun, 6 Sep 2026 18:22:34 -0400
+Subject: [PATCH] meson: Make the build usable as a subproject
+
+virglrenderer builds fine on its own, but several details only work when
+it, libepoxy and Python are all found the way a standalone build finds
+them:
+
+  - epoxy_dep.get_variable() names a pkg-config variable only, so it
+    raises when libepoxy is itself a subproject and the dependency is an
+    internal one.  libepoxy already exports epoxy_has_egl and
+    epoxy_has_glx through declare_dependency(variables: ...), so name the
+    internal variable as well.
+
+  - cc.has_header() refuses internal dependencies outright.  A subproject
+    libepoxy necessarily ships its own headers, so consult only the
+    epoxy_has_* variable in that case.
+
+    Together these two make EGL detectable when libepoxy is built
+    alongside virglrenderer, which is the usual arrangement on platforms
+    with no system EGL, such as macOS.
+
+  - find_installation('python3') resolves the name against PATH, ignoring
+    both the machine file's 'python' entry and the interpreter meson
+    itself runs under.  A parent project that runs meson from a virtual
+    environment - QEMU does - therefore has no way to supply the PyYAML
+    the Gallium format tables need.  Drop the explicit name so the usual
+    resolution applies.
+
+  - gallium_dep re-exports u_format_table.c, which libgallium already
+    compiles.  Within virglrenderer that is merely redundant; for an
+    external consumer it means compiling the file with the consumer's
+    flags, without our include directories or configuration, which fails.
+    Export only the generated header, which is what consumers need in
+    order to be ordered correctly.
+
+  - libvirglrenderer_dep carries no version, so dependency() reports
+    'undefined' to the parent project.  Consumers that inspect it - QEMU
+    derives VIRGL_VERSION_MAJOR/MINOR/MICRO from the version - then
+    misbehave.  Declare the project version, and override the
+    'virglrenderer' dependency name so the fallback resolves cleanly.
+---
+ meson.build             | 27 ++++++++++++++++++++++++---
+ src/gallium/meson.build | 10 ++++++++--
+ src/meson.build         |  5 ++++-
+ 3 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index ac3a1c9..9ce7e74 100644
+--- a/meson.build
++++ b/meson.build
+@@ -80,7 +80,7 @@ flags = [
+ 
+ add_project_arguments(cc.get_supported_arguments(flags), language : 'c')
+ 
+-prog_python = import('python').find_installation('python3')
++prog_python = import('python').find_installation()
+ 
+ not_found = dependency('', required: false)
+ gbm_dep = not_found
+@@ -293,8 +293,21 @@ with_glx = require_glx or auto_egl_glx
+ have_egl = false
+ have_glx = false
+ 
++# cc.has_header() rejects internal dependencies, and one is exactly what we get
++# when libepoxy is built as a subproject alongside us.  In that case its headers
++# are necessarily present, so the epoxy_has_* variable is the whole answer.
++epoxy_is_internal = epoxy_dep.type_name() == 'internal'
++
+ if with_egl
+-   if cc.has_header('epoxy/egl.h', dependencies: epoxy_dep) and epoxy_dep.get_variable(pkgconfig: 'epoxy_has_egl') == '1'
++   epoxy_has_egl = epoxy_dep.get_variable(pkgconfig: 'epoxy_has_egl',
++                                          internal: 'epoxy_has_egl',
++                                          default_value: '0') == '1'
++   if not epoxy_is_internal
++      epoxy_has_egl = epoxy_has_egl and cc.has_header('epoxy/egl.h',
++                                                      dependencies: epoxy_dep)
++   endif
++
++   if epoxy_has_egl
+       if with_host_windows or with_host_darwin
+          have_egl = true
+       else
+@@ -316,7 +329,15 @@ if with_egl
+ endif
+ 
+ if with_glx
+-   if cc.has_header('epoxy/glx.h', dependencies: epoxy_dep) and epoxy_dep.get_variable(pkgconfig: 'epoxy_has_glx') == '1'
++   epoxy_has_glx = epoxy_dep.get_variable(pkgconfig: 'epoxy_has_glx',
++                                          internal: 'epoxy_has_glx',
++                                          default_value: '0') == '1'
++   if not epoxy_is_internal
++      epoxy_has_glx = epoxy_has_glx and cc.has_header('epoxy/glx.h',
++                                                      dependencies: epoxy_dep)
++   endif
++
++   if epoxy_has_glx
+       glx_dep = dependency('x11', required: require_glx)
+       have_glx = glx_dep.found()
+       conf_data.set('HAVE_EPOXY_GLX_H', 1)
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+index ac8f8be..47c38f1 100644
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -69,7 +69,7 @@ sources_libgallium = files(
+ inc_gallium = include_directories('include', 'auxiliary', 'auxiliary/util')
+ 
+ pymod = import('python')
+-python3 = pymod.find_installation('python3', modules: ['yaml'])
++python3 = pymod.find_installation(modules: ['yaml'])
+ 
+ u_format_gen_h = custom_target(
+   'u_format_gen.h',
+@@ -101,6 +101,12 @@ libgallium = static_library(
+ gallium_dep = declare_dependency(
+    link_with: libgallium,
+    include_directories: [inc_gallium, inc_configuration],
+-   sources: [u_format_table_c, u_format_gen_h],
++   # Only the generated header.  u_format_table.c is already compiled into
++   # libgallium above; listing it here as well makes every consumer of this
++   # dependency compile it a second time, using the consumer's own flags
++   # rather than ours.  That is merely redundant within virglrenderer, but
++   # breaks outright for an external consumer, which has neither our include
++   # directories nor our configuration.
++   sources: [u_format_gen_h],
+    dependencies: mesa_dep,
+ )
+diff --git a/src/meson.build b/src/meson.build
+index f4a2272..534d4da 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -303,9 +303,12 @@ pkg.generate(libvirglrenderer,
+ libvirglrenderer_dep = declare_dependency(
+    link_with: libvirglrenderer,
+    include_directories: libvirgl_inc,
+-   dependencies : [libvirgl_dep, gallium_dep]
++   dependencies : [libvirgl_dep, gallium_dep],
++   version : meson.project_version()
+ )
+ 
++meson.override_dependency('virglrenderer', libvirglrenderer_dep)
++
+ # Version header
+ version_conf = configuration_data()
+ version_conf.set('VIRGL_MAJOR_VERSION', virgl_major_version)

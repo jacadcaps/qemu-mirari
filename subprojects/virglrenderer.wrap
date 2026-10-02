@@ -1,0 +1,7 @@
+[wrap-git]
+url = https://gitlab.freedesktop.org/virgl/virglrenderer.git
+revision = d5333db881bf923f5c9b1c6594323372216477dd
+diff_files = virglrenderer/0001-vrend-Relax-the-GLSL-ES-version-requirement.patch, virglrenderer/0002-vrend-Use-integer-vertex-attribute-on-ANGLE-on-Apple.patch, virglrenderer/0003-vrend-Implement-fallback-for-GL_CLAMP_TO_BORDER.patch, virglrenderer/0004-meson-Make-the-build-usable-as-a-subproject.patch
+
+[provide]
+virglrenderer = libvirglrenderer_dep

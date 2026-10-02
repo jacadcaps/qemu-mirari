@@ -107,6 +107,9 @@ meson_options_help() {
   printf "%s\n" '  bochs           bochs image format support'
   printf "%s\n" '  bpf             eBPF support'
   printf "%s\n" '  brlapi          brlapi character device driver'
+  printf "%s\n" '  bundled-gl-stack'
+  printf "%s\n" '                  Build ANGLE, libepoxy and virglrenderer from'
+  printf "%s\n" '                  subprojects/ (default: macOS only)'
   printf "%s\n" '  bzip2           bzip2 support for DMG images'
   printf "%s\n" '  canokey         CanoKey support'
   printf "%s\n" '  cap-ng          cap_ng support'
@@ -270,6 +273,8 @@ _meson_option_parse() {
     --disable-bpf) printf "%s" -Dbpf=disabled ;;
     --enable-brlapi) printf "%s" -Dbrlapi=enabled ;;
     --disable-brlapi) printf "%s" -Dbrlapi=disabled ;;
+    --enable-bundled-gl-stack) printf "%s" -Dbundled_gl_stack=enabled ;;
+    --disable-bundled-gl-stack) printf "%s" -Dbundled_gl_stack=disabled ;;
     --enable-bzip2) printf "%s" -Dbzip2=enabled ;;
     --disable-bzip2) printf "%s" -Dbzip2=disabled ;;
     --enable-canokey) printf "%s" -Dcanokey=enabled ;;

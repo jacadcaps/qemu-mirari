@@ -1,0 +1,7 @@
+[wrap-git]
+url = https://github.com/anholt/libepoxy.git
+revision = d1f952c4565c389d82fd1657153e84e050f35b27
+diff_files = libepoxy/0001-Disable-desktop-only-extension-functions-for-ES.patch, libepoxy/0002-Enable-eglGetPlatformDisplay-for-1.5.patch, libepoxy/0003-Add-a-preferred-directory-for-dlopen.patch
+
+[provide]
+epoxy = libepoxy_dep

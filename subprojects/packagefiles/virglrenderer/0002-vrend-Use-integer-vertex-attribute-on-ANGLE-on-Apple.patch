@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Akihiko Odaki <odaki@rsg.ci.i.u-tokyo.ac.jp>
+Date: Mon, 22 Dec 2025 14:19:56 +0900
+Subject: [PATCH 2/3] vrend: Use integer vertex attribute on ANGLE on Apple
+
+This is necessary to render image_resize example of WebRender in
+changeset 722505:8b4648e13c46 on M2 MacBook Air.
+
+Signed-off-by: Akihiko Odaki <odaki@rsg.ci.i.u-tokyo.ac.jp>
+---
+ src/vrend/vrend_renderer.c | 20 ++++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 3282e39..a0bc077 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -3456,7 +3456,8 @@ void vrend_bind_vertex_elements_state(struct vrend_context *ctx,
+       return;
+    }
+ 
+-   if (has_feature(feat_gles31_vertex_attrib_binding) && v->id == 0) {
++   if (has_feature(feat_gles31_vertex_attrib_binding)) {
++      if (v->id == 0) {
+       glGenVertexArrays(1, &v->id);
+       glBindVertexArray(v->id);
+       for (uint32_t i = 0; i < v->count; i++) {
+@@ -3474,6 +3475,17 @@ void vrend_bind_vertex_elements_state(struct vrend_context *ctx,
+          glVertexAttribBinding(i, ve->base.vertex_buffer_index);
+          glVertexBindingDivisor(i, ve->base.instance_divisor);
+          glEnableVertexAttribArray(i);
++         }
++      }
++   } else {
++      for (uint32_t i = 0; i < v->count; i++) {
++         struct vrend_vertex_element *ve = &v->elements[i];
++
++         if (util_format_is_pure_integer(ve->base.src_format)) {
++            UPDATE_INT_SIGN_MASK(ve->base.src_format, i,
++                                 v->signed_int_bitmask,
++                                 v->unsigned_int_bitmask);
++         }
+       }
+    }
+ }
+@@ -7558,11 +7570,7 @@ static bool use_integer(void) {
+       return true;
+ 
+    const char * a = (const char *) glGetString(GL_VENDOR);
+-   if (!a)
+-       return false;
+-   if (strcmp(a, "ARM") == 0)
+-      return true;
+-   return false;
++   return a && !(strcmp(a, "ARM") && strcmp(a, "Google Inc. (Apple)"));
+ }
+ 
+ static bool vrend_use_gbm_layout_feature(UNUSED uint32_t flags)

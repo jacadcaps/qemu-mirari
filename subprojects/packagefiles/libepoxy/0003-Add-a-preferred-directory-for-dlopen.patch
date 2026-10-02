@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jacek Piszczek <deepseek_ai@runbox.com>
+Date: Sun, 6 Sep 2026 19:39:18 -0400
+Subject: [PATCH] Add a preferred directory for dlopen()
+
+Epoxy dlopen()s each GL library by its bare filename, so the search is
+limited to the dynamic linker's own path.  An application that ships a
+specific GL implementation in a private prefix - for example an ANGLE
+build installed next to the binary that uses it - has no way to say so.
+Worse, if some other implementation is installed where the linker does
+look, that unrelated one is picked up silently.
+
+Add a 'preferred-libdir' option naming a directory to try before the bare
+name.  An absolute value is used as-is.  A relative one is resolved
+against the directory holding the running executable, so that a tree
+containing an executable and the GL libraries it ships can be moved
+without being rebuilt.  The option is empty by default, so nothing
+changes for existing builds.
+---
+ meson.build           |  3 ++
+ meson_options.txt     |  4 +++
+ src/dispatch_common.c | 74 ++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/meson.build b/meson.build
+index 9fa9225..546cbfb 100644
+--- a/meson.build
++++ b/meson.build
+@@ -29,6 +29,9 @@ conf.set_quoted('PACKAGE_LIBDIR', join_paths(get_option('prefix'), get_option('l
+ conf.set_quoted('PACKAGE_LOCALEDIR', join_paths(get_option('prefix'), get_option('datadir'), 'locale'))
+ conf.set_quoted('PACKAGE_LIBEXECDIR', join_paths(get_option('prefix'), get_option('libexecdir')))
+ conf.set('HAVE_KHRPLATFORM_H', cc.has_header('KHR/khrplatform.h'))
++if get_option('preferred-libdir') != ''
++  conf.set_quoted('PREFERRED_LIBDIR', get_option('preferred-libdir'))
++endif
+ 
+ # GLX can be used on different platforms, so we expose a
+ # configure time switch to enable or disable it; in case
+diff --git a/meson_options.txt b/meson_options.txt
+index dc30e68..e3bce4b 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -19,3 +19,7 @@ option('tests',
+        type: 'boolean',
+        value: true,
+        description: 'Build the test suite')
++option('preferred-libdir',
++       type: 'string',
++       value: '',
++       description: 'Directory searched before the dynamic linker when opening a GL library; if relative, resolved against the running executable')
+diff --git a/src/dispatch_common.c b/src/dispatch_common.c
+index 3ba9b0f..84b20a2 100644
+--- a/src/dispatch_common.c
++++ b/src/dispatch_common.c
+@@ -164,6 +164,7 @@
+ #include <windows.h>
+ #else
+ #include <dlfcn.h>
++#include <limits.h>
+ #include <err.h>
+ #include <pthread.h>
+ #endif
+@@ -173,6 +174,10 @@
+ 
+ #include "dispatch_common.h"
+ 
++#if defined(PREFERRED_LIBDIR) && defined(__APPLE__)
++#include <mach-o/dyld.h>
++#endif
++
+ #if defined(__APPLE__)
+ #define GLX_LIB "/opt/X11/lib/libGL.1.dylib"
+ #define EGL_LIB "libEGL.dylib"
+@@ -290,6 +295,54 @@ library_init(void)
+     library_initialized = true;
+ }
+ 
++#ifdef PREFERRED_LIBDIR
++/**
++ * Build the path to look in before falling back to the dynamic linker.
++ *
++ * An absolute PREFERRED_LIBDIR is used as-is.  A relative one is resolved
++ * against the directory holding the running executable, so that a tree
++ * containing both the executable and its GL libraries can be relocated
++ * without being rebuilt.
++ */
++static bool
++preferred_lib_path(char *out, size_t out_size, const char *lib_name)
++{
++    int len;
++
++    if (PREFERRED_LIBDIR[0] == '/') {
++        len = snprintf(out, out_size, "%s/%s", PREFERRED_LIBDIR, lib_name);
++    } else {
++        char exe[PATH_MAX];
++        char *sep;
++
++#if defined(__APPLE__)
++        uint32_t exe_size = sizeof(exe);
++
++        if (_NSGetExecutablePath(exe, &exe_size) != 0)
++            return false;
++#elif defined(__linux__)
++        ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
++
++        if (n <= 0)
++            return false;
++        exe[n] = '\0';
++#else
++        return false;
++#endif
++
++        sep = strrchr(exe, '/');
++        if (!sep)
++            return false;
++        *sep = '\0';
++
++        len = snprintf(out, out_size, "%s/%s/%s", exe, PREFERRED_LIBDIR,
++                       lib_name);
++    }
++
++    return len > 0 && (size_t)len < out_size;
++}
++#endif
++
+ static bool
+ get_dlopen_handle(void **handle, const char *lib_name, bool exit_on_fail, bool load)
+ {
+@@ -310,7 +363,26 @@ get_dlopen_handle(void **handle, const char *lib_name, bool exit_on_fail, bool l
+         if (!load)
+             flags |= RTLD_NOLOAD;
+ 
+-        *handle = dlopen(lib_name, flags);
++#ifdef PREFERRED_LIBDIR
++        /*
++         * An application that ships its own GL implementation needs that one,
++         * not whatever else happens to be installed.  dlopen() of a bare name
++         * consults only the dynamic linker's search path, which does not cover
++         * a private prefix and may well turn up a different implementation, so
++         * look in the configured directory first.
++         */
++        if (lib_name[0] != '/') {
++            char path[PATH_MAX];
++
++            if (preferred_lib_path(path, sizeof(path), lib_name))
++                *handle = dlopen(path, flags);
++            if (!*handle)
++                (void)dlerror();
++        }
++#endif
++        if (!*handle) {
++            *handle = dlopen(lib_name, flags);
++        }
+         if (!*handle) {
+             if (exit_on_fail) {
+                 fprintf(stderr, "Couldn't open %s: %s\n", lib_name, dlerror());

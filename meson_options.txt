@@ -214,6 +214,8 @@ option('rbd', type : 'feature', value : 'auto',
        description: 'Ceph block device driver')
 option('opengl', type : 'feature', value : 'auto',
        description: 'OpenGL support')
+option('bundled_gl_stack', type : 'feature', value : 'auto',
+       description: 'Build ANGLE, libepoxy and virglrenderer from subprojects/ (default: macOS only)')
 option('rdma', type : 'feature', value : 'auto',
        description: 'Enable RDMA-based migration')
 option('gtk', type : 'feature', value : 'auto',

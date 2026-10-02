@@ -67,6 +67,16 @@ static void virtio_vga_base_gl_block(void *opaque, bool block)
     }
 }
 
+static void virtio_vga_base_gl_force_ctx(void *opaque)
+{
+    VirtIOVGABase *vvga = opaque;
+    VirtIOGPUBase *g = vvga->vgpu;
+
+    if (g->hw_ops->gl_force_ctx) {
+        g->hw_ops->gl_force_ctx(g);
+    }
+}
+
 static int virtio_vga_base_get_flags(void *opaque)
 {
     VirtIOVGABase *vvga = opaque;
@@ -82,6 +92,7 @@ static const GraphicHwOps virtio_vga_base_ops = {
     .text_update = virtio_vga_base_text_update,
     .ui_info = virtio_vga_base_ui_info,
     .gl_block = virtio_vga_base_gl_block,
+    .gl_force_ctx = virtio_vga_base_gl_force_ctx,
 };
 
 static const VMStateDescription vmstate_virtio_vga_base = {
