@@ -1,4 +1,13 @@
 ===========
+Mirari Support:
+
+./configure --target-list=ppc-softmmu,ppc64-softmmu
+
+Run:
+
+qemu-system-ppc64 -M mirari -kernel boot.img -cdrom MorphOS3.20.iso 
+
+===========
 QEMU README
 ===========
 
