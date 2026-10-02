@@ -1,4 +1,15 @@
 ===========
+MacOS Virtio GL render support patches
+
+./configure --target-list=... --enable-opengl --enable-virglrenderer
+
+If it fails to build angle with
+> xcode-select: error: tool 'xcodebuild' requires Xcode, but active developer directory
+you might need to do:
+
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+
+===========
 QEMU README
 ===========
 
